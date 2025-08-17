@@ -1,91 +1,113 @@
-# app/services/photo.py
 import os
 import uuid
 from uuid import UUID
 from fastapi import UploadFile, HTTPException
 from datetime import datetime, timezone, timedelta
-from typing import Optional, List
-
+from typing import Optional, List, Dict, Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-
 from schemas.photo import PhotoCreate
 from db.models.photo import Photo
 from db.models.user import User
+from services.blob_storage import BlobStorageService, get_blob_service_client
 
-# S3용 BlobStorageService (우리가 S3로 구현한 버전)
-from services.blob_storage import BlobStorageService
+UPLOAD_DIR = "uploads"
 
 class PhotoService:
     def __init__(self, db: AsyncSession):
         self.db = db
-        # S3 prefix를 'photo'로 사용 (예전 Azure 컨테이너명이 'photo'였던 것 맞춤)
-        self.blob_storage = BlobStorageService(container_type="photo")
+        self.blob_storage = BlobStorageService()
 
     async def create_photo(
-        self,
-        file: UploadFile,
+        self, 
+        file: UploadFile, 
         current_user: User,
         year: int,
         season: str,
         description: Optional[str] = None
     ) -> Photo:
         """
-        사진 업로드 + 메타데이터 저장 (S3 사용)
-        DB에는 기존과 동일하게 URL을 저장 (스키마 변경 최소화)
+        사진을 업로드하고 메타데이터를 저장합니다.
+        
+        Args:
+            file: 업로드할 파일
+            current_user: 현재 사용자
+            year: 사진 연도
+            season: 사진 계절 (spring, summer, autumn, winter)
+            description: 사진 설명 (텍스트)
         """
+        temp_file_path = None
         try:
-            content = await file.read()
+            # 임시 파일로 저장
+            temp_file_path = f"{UPLOAD_DIR}/{uuid.uuid4()}_{file.filename}"
+            os.makedirs(UPLOAD_DIR, exist_ok=True)
+            
+            with open(temp_file_path, "wb") as buffer:
+                content = await file.read()
+                buffer.write(content)
 
-            # S3 업로드: (url, key) 반환
-            uploaded_url, object_key = await self.blob_storage.upload_file(
-                file_data=content,
-                filename=file.filename
-            )
+            # Blob Storage에 업로드
+            blob_service_client = get_blob_service_client()
+            photo_url = await upload_photo_to_blob(temp_file_path, file.filename, blob_service_client)
 
-            # DB에 메타데이터 저장 (기존 스키마 유지: url만 저장)
+            # DB에 메타데이터 저장
             photo_data = PhotoCreate(
-                name=file.filename,                  # 원본 파일명 유지
+                name=file.filename,
                 family_id=current_user.family_id,
                 user_id=current_user.id,
-                url=uploaded_url,                    # 정적 URL 저장 (private이면 presigned로 응답하도록 라우터에서 처리)
+                url=photo_url,
                 year=year,
                 season=season,
                 description=description
             )
-
+            
             return await save_photo_to_db(photo_data, self.db)
 
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
+        finally:
+            if temp_file_path and os.path.exists(temp_file_path):
+                os.remove(temp_file_path)
 
     async def delete_photo(self, photo_id: UUID) -> bool:
         """
-        사진 삭제: S3 객체 삭제 + DB 레코드 삭제
-        - URL만 DB에 저장되어 있어도, S3 서비스가 URL에서 key를 파싱해 삭제 가능
+        사진을 삭제합니다.
         """
         try:
             result = await self.db.execute(
                 select(Photo).where(Photo.id == photo_id)
             )
             photo = result.scalar_one_or_none()
-
+            
             if not photo:
                 return False
-
-            # S3에서 삭제 (url 또는 key 모두 허용하도록 S3 서비스 구현됨)
-            deleted = await self.blob_storage.delete_file(photo.url)
-
+            
+            # Azure Blob Storage에서 파일 삭제
+            await self.blob_storage.delete_file(photo.name)
             await self.db.delete(photo)
             await self.db.commit()
-            return bool(deleted)
-
+            return True
+            
         except Exception as e:
             await self.db.rollback()
             raise HTTPException(status_code=500, detail=f"사진 삭제 중 오류가 발생했습니다: {str(e)}")
 
-
-# ---- 아래 헬퍼는 기존 로직 유지 (DB 저장 부분) ----
+async def upload_photo_to_blob(file_path: str, original_filename: str, blob_service_client) -> str:
+    """
+    Azure Blob Storage에 사진을 업로드합니다.
+    """
+    blob_name = f"{uuid.uuid4()}_{original_filename}"
+    try:
+        if not hasattr(blob_service_client, 'container_client'):
+            raise ValueError('지원하지 않는 blob_service_client 타입입니다.')
+            
+        blob_client = blob_service_client.container_client.get_blob_client(blob_name)
+        with open(file_path, "rb") as data:
+            blob_client.upload_blob(data, overwrite=True)
+            return blob_client.url
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Blob Storage 업로드 실패: {str(e)}")
 
 async def save_photo_to_db(photo_data: PhotoCreate, db: AsyncSession) -> Photo:
     """
@@ -102,16 +124,15 @@ async def save_photo_to_db(photo_data: PhotoCreate, db: AsyncSession) -> Photo:
             family_id=photo_data.family_id,
             uploaded_at=datetime.now(timezone(timedelta(hours=9))).replace(tzinfo=None)
         )
-
+        
         db.add(photo)
         await db.commit()
         await db.refresh(photo)
         return photo
-
+        
     except Exception as e:
         await db.rollback()
         raise HTTPException(status_code=500, detail=f"데이터베이스 저장 실패: {str(e)}")
-
 
 async def get_photos_by_family(family_id: UUID, db: AsyncSession) -> List[Photo]:
     """
@@ -125,6 +146,6 @@ async def get_photos_by_family(family_id: UUID, db: AsyncSession) -> List[Photo]
             .order_by(Photo.year.desc(), Photo.season)
         )
         return result.scalars().all()
-
+        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"사진 조회 실패: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"사진 조회 실패: {str(e)}") 

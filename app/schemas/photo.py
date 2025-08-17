@@ -1,25 +1,35 @@
 from pydantic import BaseModel, Field, ConfigDict
 from datetime import datetime
-from typing import Optional, Dict, Any, Literal
+from typing import Optional, Literal
 from uuid import UUID
 
+# 공통 베이스 (응답 기준)
 class PhotoBase(BaseModel):
     id: UUID
     name: Optional[str] = None
-    url: str
+
+    # S3 전환: key/bucket 중심
+    key: Optional[str] = None
+    bucket: Optional[str] = None
+    content_type: Optional[str] = None
+    size: Optional[int] = None
+    etag: Optional[str] = None
+
+    # 과거 호환용 (있으면 내려주고, 없으면 presigned URL을 라우터에서 생성해서 내려도 됨)
+    url: Optional[str] = None
+
     year: int
     season: Literal["spring", "summer", "autumn", "winter"]
     description: Optional[str] = None
     user_id: UUID
     family_id: UUID
 
-# PhotoCreate가 PhotoBase를 상속받지 않는 이유:
-# 1. id는 DB에서 자동 생성되는 필드이므로 생성 시에는 필요하지 않음
-# 2. PhotoBase는 id를 포함하고 있어서, 상속받으면 불필요한 id 필드가 생성 요청에 포함됨
-# 3. 생성 요청과 응답의 스키마를 명확하게 분리하여 관리
 class PhotoCreate(BaseModel):
+    """
+    생성 시 서버가 업로드 후 key/bucket/meta를 채우므로
+    클라이언트는 보통 파일만 올리고 메타만 보냄. (url 제거)
+    """
     name: Optional[str] = None
-    url: str
     year: int
     season: Literal["spring", "summer", "autumn", "winter"]
     description: Optional[str] = None
@@ -28,4 +38,4 @@ class PhotoCreate(BaseModel):
 
 class PhotoResponse(PhotoBase):
     uploaded_at: datetime
-    model_config = ConfigDict(from_attributes=True) 
+    model_config = ConfigDict(from_attributes=True)
