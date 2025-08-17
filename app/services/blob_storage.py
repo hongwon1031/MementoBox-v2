@@ -1,126 +1,96 @@
-import os
-from azure.storage.blob import BlobServiceClient, BlobClient
+# app/services/storage_s3.py
+import io
+import mimetypes
 from datetime import datetime
-from typing import Optional, Literal
+from typing import Optional
+
+import boto3
+from botocore.exceptions import ClientError
+from fastapi import UploadFile
 from core.config import settings
 
-ContainerType = Literal["photo", "talking-voice"]
+def _content_type(filename: str) -> str:
+    c, _ = mimetypes.guess_type(filename)
+    return c or "application/octet-stream"
 
-class BlobStorageService:
-    def __init__(self, container_type: ContainerType = "photo"):
-        # 환경 변수에서 설정 가져오기
-        self.account_name = os.getenv("AZURE_BLOBSTORAGE_ACCOUNT")
-        self.account_key = os.getenv("AZURE_BLOBSTORAGE_KEY")
-        
-        # 컨테이너 타입에 따라 다른 컨테이너 이름 사용
-        self.container_name = container_type
-        
-        # 연결 문자열 생성
-        connection_string = f"DefaultEndpointsProtocol=https;AccountName={self.account_name};AccountKey={self.account_key};EndpointSuffix=core.windows.net"
-        
-        # Blob Service Client 생성
-        self.blob_service_client = BlobServiceClient.from_connection_string(connection_string)
-        self.container_client = self.blob_service_client.get_container_client(self.container_name)
-
-    async def upload_file(self, file_data: bytes, filename: str) -> tuple[str, str]:
-        """
-        파일을 Azure Blob Storage에 업로드하고 URL과 blob_name을 반환합니다.
-        """
-        # 타임스탬프를 포함한 고유한 파일명 생성
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        blob_name = f"{timestamp}_{filename}"
-        
-        # Blob 클라이언트 생성
-        blob_client = self.container_client.get_blob_client(blob_name)
-        
-        # 파일 업로드
-        blob_client.upload_blob(file_data, overwrite=True)
-        
-        # Blob URL 생성
-        blob_url = blob_client.url
-        
-        return blob_url, blob_name
-
-    async def download_file(self, blob_url: str) -> bytes:
-        """
-        Azure Blob Storage에서 파일을 다운로드하여 bytes로 반환합니다.
-        """
-        try:
-            # URL 파싱: https://{account}.blob.core.windows.net/{container}/{blob_name}
-            url_parts = blob_url.split('/')
-            if len(url_parts) < 5:
-                raise ValueError(f"Invalid blob URL format: {blob_url}")
-            
-            # 컨테이너와 blob_name 추출
-            container_name = url_parts[4]  # https://account.blob.core.windows.net/container/...
-            blob_name = '/'.join(url_parts[5:])  # blob_name (경로가 포함될 수 있음)
-            
-            print(f"🔍 URL 파싱 결과:")
-            print(f"   - Container: {container_name}")
-            print(f"   - Blob name: {blob_name}")
-            print(f"   - Current container: {self.container_name}")
-            
-            # 컨테이너 불일치 체크
-            if container_name != self.container_name:
-                print(f"⚠️ 컨테이너 불일치: URL={container_name}, Service={self.container_name}")
-                # URL에서 추출한 컨테이너로 새로운 클라이언트 생성
-                correct_container_client = self.blob_service_client.get_container_client(container_name)
-                blob_client = correct_container_client.get_blob_client(blob_name)
-            else:
-                blob_client = self.container_client.get_blob_client(blob_name)
-            
-            # 파일 다운로드
-            download_stream = blob_client.download_blob()
-            return download_stream.readall()
-        except Exception as e:
-            print(f"Error downloading blob: {str(e)}")
-            print(f"Full URL: {blob_url}")
-            raise e
-
-    async def delete_file(self, blob_name: str) -> bool:
-        """
-        Azure Blob Storage에서 파일을 삭제합니다.
-        """
-        try:
-            blob_client = self.container_client.get_blob_client(blob_name)
-            blob_client.delete_blob()
-            return True
-        except Exception as e:
-            print(f"Error deleting blob: {str(e)}")
-            return False
-
-async def download_file_from_url(blob_url: str) -> bytes:
+class S3Storage:
     """
-    URL을 직접 사용하여 Azure Blob Storage에서 파일을 다운로드합니다.
-    컨테이너 타입에 상관없이 URL만으로 다운로드가 가능합니다.
+    S3 네이티브 서비스:
+      - 업로드(바이트/스트림/UploadFile)
+      - 다운로드(bytes)
+      - 삭제
+      - 프리사인 URL (GET/PUT)
+    prefix로 “폴더” 느낌만 주면 됨.
     """
-    try:
-        # 환경 변수에서 설정 가져오기
-        account_name = os.getenv("AZURE_BLOBSTORAGE_ACCOUNT")
-        account_key = os.getenv("AZURE_BLOBSTORAGE_KEY")
-        
-        # 연결 문자열 생성
-        connection_string = f"DefaultEndpointsProtocol=https;AccountName={account_name};AccountKey={account_key};EndpointSuffix=core.windows.net"
-        
-        # BlobClient를 URL에서 직접 생성 (올바른 방법)
-        blob_client = BlobClient.from_blob_url(blob_url, credential=account_key)
-        
-        print(f"🔍 Blob 정보:")
-        print(f"   - Account: {blob_client.account_name}")
-        print(f"   - Container: {blob_client.container_name}")
-        print(f"   - Blob: {blob_client.blob_name}")
-        
-        # 파일 다운로드
-        download_stream = blob_client.download_blob()
-        return download_stream.readall()
-        
-    except Exception as e:
-        print(f"Error downloading blob from URL: {str(e)}")
-        print(f"URL: {blob_url}")
-        raise e
+    def __init__(self, prefix: str = "photos"):
+        self.bucket = settings.AWS_S3_BUCKET
+        self.region = settings.AWS_DEFAULT_REGION
+        self.prefix = prefix.rstrip("/")
+        self.s3 = boto3.client(
+            "s3",
+            aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+            region_name=self.region,
+        )
 
-def get_blob_service_client(container_type: ContainerType = "photo") -> BlobStorageService:
-    """
-    BlobStorageService의 인스턴스를 생성하여 반환합니다.
-    """
-    return BlobStorageService(container_type) 
+    def _key(self, filename: str) -> str:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return f"{self.prefix}/{ts}_{filename}"
+
+    # 1) Upload: bytes
+    def upload_bytes(self, data: bytes, filename: str, public: bool = False) -> tuple[str, str]:
+        key = self._key(filename)
+        extra = {
+            "ContentType": _content_type(filename),
+            "ServerSideEncryption": "AES256",
+        }
+        if public:
+            extra["ACL"] = "public-read"
+
+        self.s3.put_object(Bucket=self.bucket, Key=key, Body=data, **extra)
+        url = f"https://{self.bucket}.s3.{self.region}.amazonaws.com/{key}"
+        return url, key
+
+    # 2) Upload: file-like (스트림)
+    def upload_stream(self, stream: io.BytesIO, filename: str, public: bool = False) -> tuple[str, str]:
+        key = self._key(filename)
+        extra = {
+            "ExtraArgs": {
+                "ContentType": _content_type(filename),
+                "ServerSideEncryption": "AES256",
+            }
+        }
+        if public:
+            extra["ExtraArgs"]["ACL"] = "public-read"
+
+        self.s3.upload_fileobj(stream, self.bucket, key, **extra)
+        url = f"https://{self.bucket}.s3.{self.region}.amazonaws.com/{key}"
+        return url, key
+
+    # 3) Upload: FastAPI UploadFile
+    async def upload_uploadfile(self, file: UploadFile, public: bool = False) -> tuple[str, str]:
+        content = await file.read()
+        return self.upload_bytes(content, file.filename, public=public)
+
+    # Download to bytes
+    def get_object_bytes(self, key: str) -> bytes:
+        obj = self.s3.get_object(Bucket=self.bucket, Key=key)
+        return obj["Body"].read()
+
+    # Delete
+    def delete_object(self, key: str) -> None:
+        self.s3.delete_object(Bucket=self.bucket, Key=key)
+
+    # Presigned URLs
+    def presigned_get(self, key: str, expires: int = 3600) -> str:
+        return self.s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": self.bucket, "Key": key},
+            ExpiresIn=expires,
+        )
+
+    def presigned_put(self, key: str, content_type: Optional[str] = None, expires: int = 600) -> str:
+        params = {"Bucket": self.bucket, "Key": key}
+        if content_type:
+            params["ContentType"] = content_type
+        return self.s3.generate_presigned_url("put_object", Params=params, ExpiresIn=expires)

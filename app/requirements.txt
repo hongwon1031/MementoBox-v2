@@ -6,7 +6,6 @@ psycopg2-binary
 python-dotenv
 alembic
 pydantic-settings
-azure-storage-blob
 aiohttp
 aiofiles
 python-multipart
@@ -14,9 +13,12 @@ python-jose[cryptography]
 passlib[bcrypt]
 pytz
 python-dateutil
-azure-cognitiveservices-speech
 pygame
 openai
 tiktoken
 numpy
 soundfile
+
+# AWS
+boto3
+aioboto3
