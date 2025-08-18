@@ -22,3 +22,6 @@ soundfile
 # AWS
 boto3
 aioboto3
+
+# supabase
+httpx==0.27.2

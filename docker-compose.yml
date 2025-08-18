@@ -1,4 +1,4 @@
-version: "3.8"
+#version: "3.8"
 
 services:
     web:
@@ -14,8 +14,8 @@ services:
             - ./app/alembic/versions:/app/alembic/versions
         expose:
             - "8000"
-        depends_on:
-            - db
+        # depends_on:
+        #     - db
         networks:
             - memento_net
 
@@ -32,29 +32,29 @@ services:
         networks:
             - memento_net
 
-    db:
-        image: postgres:15
-        container_name: postgres_db
-        restart: always
-        ports:
-            - "5432:5432"
-        environment:
-            POSTGRES_USER: ${POSTGRES_USER}
-            POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-            POSTGRES_DB: ${POSTGRES_DB}
-        healthcheck:
-            test:
-                [
-                    "CMD-SHELL",
-                    "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}",
-                ]
-            interval: 5s
-            timeout: 5s
-            retries: 5
-        volumes:
-            - fastapi-app_pgdata:/var/lib/postgresql/data
-        networks:
-            - memento_net
+    # db:
+    #     image: postgres:15
+    #     container_name: postgres_db
+    #     restart: always
+    #     ports:
+    #         - "5432:5432"
+    #     environment:
+    #         POSTGRES_USER: ${POSTGRES_USER}
+    #         POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    #         POSTGRES_DB: ${POSTGRES_DB}
+    #     healthcheck:
+    #         test:
+    #             [
+    #                 "CMD-SHELL",
+    #                 "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}",
+    #             ]
+    #         interval: 5s
+    #         timeout: 5s
+    #         retries: 5
+    #     volumes:
+    #         - fastapi-app_pgdata:/var/lib/postgresql/data
+    #     networks:
+    #         - memento_net
 
     # dialogue:
     #   build:
